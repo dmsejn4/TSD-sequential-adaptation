@@ -11,7 +11,28 @@ for batch in task1_loader:            # Task 1 train split 일부 (예: 500~1000
 #2.학습 루프에 추가할 penalty def
 def ewc_penalty(model, fisher, theta_star, lam):
     pen = 0.0
+
     for n, p in model.named_parameters():
         if n in fisher:
             pen += (fisher[n] * (p - theta_star[n]) ** 2).sum()
+##################################################################
+    for n, p in model.named_parameters():
+
+        if n not in fisher:
+            continue
+
+        if n not in theta_star:
+            continue
+
+        if p.shape != fisher[n].shape:
+            continue
+
+        if p.shape != theta_star[n].shape:
+            continue
+
+        pen += (
+            fisher[n].to(p.device)
+            * (p - theta_star[n].to(p.device)) ** 2
+        ).sum()
+##################################################################
     return lam / 2 * pen.float()
