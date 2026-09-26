@@ -13,10 +13,6 @@ def ewc_penalty(model, fisher, theta_star, lam):
     pen = 0.0
 
     for n, p in model.named_parameters():
-        if n in fisher:
-            pen += (fisher[n] * (p - theta_star[n]) ** 2).sum()
-##################################################################
-    for n, p in model.named_parameters():
 
         if n not in fisher:
             continue
@@ -34,5 +30,5 @@ def ewc_penalty(model, fisher, theta_star, lam):
             fisher[n].to(p.device)
             * (p - theta_star[n].to(p.device)) ** 2
         ).sum()
-##################################################################
+
     return lam / 2 * pen.float()
