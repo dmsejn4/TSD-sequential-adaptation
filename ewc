@@ -1,0 +1,176 @@
+#1. loss 스케일 확인
+!grep -n "return loss" /content/YOLO-TS/ultralytics/utils/loss.py
+  ## 이거 확인해야 lambda 값 정할 수 있음 
+import inspect
+from ultralytics.data.build import build_yolo_dataset
+print(inspect.signature(build_yolo_dataset))
+print(inspect.signature(YOLO("/content/YOLO-TS/YOLO-TS_TT100K.yaml").model.loss))
+
+#2. Fisher 계산 함수 정의
+def compute_fisher(ckpt_path, arch_yaml, data_yaml, n_samples=500, imgsz=640):
+    model = YOLO(arch_yaml)
+    model.load(ckpt_path)
+    det = model.model.cuda()
+
+    theta_star = {n: p.detach().clone() for n, p in det.named_parameters()}
+    fisher     = {n: torch.zeros_like(p) for n, p in det.named_parameters() if p.requires_grad}
+
+    # loss 계산에 필요한 하이퍼파라미터 부착
+    det.args = get_cfg(DEFAULT_CFG)
+    det.args.imgsz = imgsz
+
+    det.train()
+    for m in det.modules():                      # BN 통계 고정
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.eval()
+
+    import yaml
+    data = yaml.safe_load(open(data_yaml))
+    data['nc'] = len(data['names'])
+    dataset = build_yolo_dataset(det.args, data['train'], 1, data, mode='val', rect=False)
+    loader  = build_dataloader(dataset, batch=1, workers=0, shuffle=False)
+
+    n_batches = 0
+    for batch in loader:
+        if n_batches >= n_samples:
+            break
+        batch['img'] = batch['img'].cuda().float() / 255
+        for k in ('batch_idx', 'cls', 'bboxes'):
+            batch[k] = batch[k].cuda()
+
+        det.zero_grad(set_to_none=True)
+        loss, _ = det.loss(batch)
+        loss.backward()
+
+        for n, p in det.named_parameters():
+            if p.grad is not None and n in fisher:
+                fisher[n] += p.grad.detach() ** 2
+        n_batches += 1
+
+    fisher = {n: f / n_batches for n, f in fisher.items()}
+    print(f"Fisher 계산 완료: {n_batches} batches, {len(fisher)} tensors")
+    det.zero_grad(set_to_none=True)
+    return fisher, theta_star
+
+#3. Model A Fisher 계산 (Model B도 같은 방식으로 최초 1회만)
+fisher_A, theta_A = compute_fisher(
+    "/content/drive/MyDrive/TT100K_best.pt",
+    "/content/YOLO-TS/YOLO-TS_TT100K.yaml",
+    "/content/dataset/TT100K.yaml", n_samples=500)
+
+torch.save({'fisher': {n: f.cpu() for n, f in fisher_A.items()},
+            'theta_star': {n: t.cpu() for n, t in theta_A.items()},
+            'n_samples': 500},
+           "/content/drive/MyDrive/review2026/ewc_modelA.pt")
+print("저장 완료")
+
+#4. penalty 함수 정의
+def ewc_penalty(model, fisher, theta_star, lam):
+    pen = 0.0
+
+    for n, p in model.named_parameters():
+
+        if n not in fisher:
+            continue
+
+        if n not in theta_star:
+            continue
+
+        if p.shape != fisher[n].shape:
+            continue
+
+        if p.shape != theta_star[n].shape:
+            continue
+
+        pen = pen + (
+            fisher[n].to(p.device)
+            * (p - theta_star[n].to(p.device)) ** 2
+        ).sum()
+
+    if not torch.is_tensor(pen):
+        return torch.zeros((), device=next(model.parameters()).device)
+
+    return lam / 2 * pen.float()
+
+#5. 학습 (매 시나리오 반복)
+import os, gc, sys, types, torch
+sys.path.insert(0, "/content/YOLO-TS"); os.chdir("/content/YOLO-TS")
+gc.collect(); torch.cuda.empty_cache()
+if not hasattr(torch, "_orig_load"):
+    torch._orig_load = torch.load
+    torch.load = lambda *a, **k: torch._orig_load(*a, **{**k, "weights_only": False})
+from ultralytics import YOLO
+
+# ── Scenario 1: TT100K → CCTSDB2021, EWC + freeze=0 ──────────
+ARCH_YAML = "/content/YOLO-TS/YOLO-TS_TT100K.yaml"
+TASK1_PT  = "/content/drive/MyDrive/TT100K_best.pt"
+DATA_YAML = "/content/dataset/CCTSDB2021.yaml"
+EWC_PT    = "/content/drive/MyDrive/review2026/ewc_modelA.pt"
+FREEZE, SEED, LAM = 0, 0, 1000.0
+RUN_NAME = f"S1_TT_to_CCTSDB_ewc{int(LAM)}_fr{FREEZE}_seed{SEED}"
+
+# 1) 구조 검증
+src = torch.load(TASK1_PT, map_location="cpu")["model"].state_dict()
+model = YOLO(ARCH_YAML)
+dst = model.model.state_dict()
+matched = sum(1 for k, v in src.items() if k in dst and dst[k].shape == v.shape)
+print(f"구조 검증: {matched}/{len(dst)}")
+assert matched == len(dst), "구조 불일치 — 학습 중단"
+model.load(TASK1_PT)
+
+# 2) Fisher/θ* 로드 → GPU
+ck = torch.load(EWC_PT, map_location="cpu")
+FISHER = {n: f.cuda() for n, f in ck['fisher'].items()}
+THETA  = {n: t.cuda() for n, t in ck['theta_star'].items()}
+
+det_model = model.model.cuda()
+applied = [n for n, p in det_model.named_parameters()
+           if n in FISHER and p.shape == FISHER[n].shape
+           and n in THETA and p.shape == THETA[n].shape]
+skipped = [n for n in FISHER if n not in applied]
+print(f"EWC 적용 {len(applied)} tensors, 제외 {len(skipped)}")
+print("제외:", skipped)
+print("초기 penalty:", ewc_penalty(det_model, FISHER, THETA, LAM).item())   # 0이어야 정상
+
+# 3) loss 래핑
+orig_loss = det_model.loss
+_step = [0]
+def loss_with_ewc(self, batch, preds=None):
+    total, items = orig_loss(batch, preds)
+    pen = ewc_penalty(self, FISHER, THETA, LAM)
+    _step[0] += 1
+    if _step[0] % 100 == 0:
+        print(f"[step {_step[0]}] det_loss={total.item():.3f}  ewc_pen={pen.item():.3f}")
+    return total + pen, items
+det_model.loss = types.MethodType(loss_with_ewc, det_model)
+
+before = {n: b.clone() for n, b in det_model.named_buffers() if 'running_' in n}
+
+##*lambda 값 탐색
+#1. λ=0으로 구현 검증 (3~5 epoch)
+LAM = 0.0
+results = model.train(..., epochs=3, name="ewc_check_lam0")
+#2. penalty 크기 확인 (1~2 epoch)
+#3. 후보 2~3개로 본 실행
+## >> 이거 하면 경우의 수가 많이 늘 거 같은데, 선택 기준을 미리 정해야 할 듯
+
+# 4) 학습
+results = model.train(
+    data=DATA_YAML,
+    imgsz=640, epochs=150, patience=15, batch=16, nbs=64,
+    optimizer="AdamW", lr0=0.0005, lrf=0.01, weight_decay=0.01,
+    cos_lr=True, warmup_epochs=5.0,
+    mosaic=1.0, close_mosaic=20, mixup=0.15, copy_paste=0.1,
+    hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
+    degrees=0.0, translate=0.1, scale=0.5, fliplr=0.0, flipud=0.0,
+    seed=SEED, deterministic=True, freeze=FREEZE, save_period=5,
+    project="/content/drive/MyDrive/runs", name=RUN_NAME,
+    amp=True, workers=2, cache=False,
+)
+
+changed = [n for n, b in det_model.named_buffers()
+           if 'running_' in n and n in before and not torch.equal(before[n], b)]
+print(f"BN buffer 변경: {len(changed)}")
+print("최종 penalty:", ewc_penalty(det_model, FISHER, THETA, LAM).item())
+
+#6. 평가로 이어지게
