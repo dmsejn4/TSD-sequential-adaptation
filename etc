@@ -1,0 +1,15 @@
+fisher = {n: torch.zeros_like(p) for n, p in model.named_parameters() if p.requires_grad}
+for batch in task1_loader:            # Task 1 train split 일부 (예: 500~1000장)
+    model.zero_grad()
+    loss, _ = model.loss(batch)
+    loss.backward()
+    for n, p in model.named_parameters():
+        if p.grad is not None:
+            fisher[n] += p.grad.detach() ** 2 / len(task1_loader)
+
+def ewc_penalty(model, fisher, theta_star, lam):
+    pen = 0.0
+    for n, p in model.named_parameters():
+        if n in fisher:
+            pen += (fisher[n] * (p - theta_star[n]) ** 2).sum()
+    return lam / 2 * pen.float()
