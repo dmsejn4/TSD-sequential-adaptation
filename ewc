@@ -106,8 +106,8 @@ ARCH_YAML = "/content/YOLO-TS/YOLO-TS_TT100K.yaml"
 TASK1_PT  = "/content/drive/MyDrive/TT100K_best.pt"
 DATA_YAML = "/content/dataset/CCTSDB2021.yaml"
 EWC_PT    = "/content/drive/MyDrive/review2026/ewc_modelA.pt"
-FREEZE, SEED, LAM = 0, 0, 1000.0
-RUN_NAME = f"S1_TT_to_CCTSDB_ewc{int(LAM)}_fr{FREEZE}_seed{SEED}"
+FREEZE, SEED, LAM = 0, 0, 1.0
+RUN_NAME = "ewc_lambda_probe"
 
 # 1) 구조 검증
 src = torch.load(TASK1_PT, map_location="cpu")["model"].state_dict()
@@ -118,46 +118,50 @@ print(f"구조 검증: {matched}/{len(dst)}")
 assert matched == len(dst), "구조 불일치 — 학습 중단"
 model.load(TASK1_PT)
 
-# 2) Fisher/θ* 로드 → GPU
+# ── 2) Fisher / θ* 로드 (CPU에 보관, 콜백에서 device 맞춤) ──────────
 ck = torch.load(EWC_PT, map_location="cpu")
-FISHER = {n: f.cuda() for n, f in ck['fisher'].items()}
-THETA  = {n: t.cuda() for n, t in ck['theta_star'].items()}
+FISHER_CPU, THETA_CPU = ck['fisher'], ck['theta_star']
+print(f"Fisher 로드: {len(FISHER_CPU)} tensors (n_samples={ck.get('n_samples')})")
 
-det_model = model.model.cuda()
-applied = [n for n, p in det_model.named_parameters()
-           if n in FISHER and p.shape == FISHER[n].shape
-           and n in THETA and p.shape == THETA[n].shape]
-skipped = [n for n in FISHER if n not in applied]
-print(f"EWC 적용 {len(applied)} tensors, 제외 {len(skipped)}")
-print("제외:", skipped)
-print("초기 penalty:", ewc_penalty(det_model, FISHER, THETA, LAM).item())   # 0이어야 정상
+# ── 3) 콜백으로 trainer.model에 EWC 부착 ──────────────────────────
+import types
 
-# 3) loss 래핑
-orig_loss = det_model.loss
-_step = [0]
-def loss_with_ewc(self, batch, preds=None):
-    total, items = orig_loss(batch, preds)
-    pen = ewc_penalty(self, FISHER, THETA, LAM)
-    _step[0] += 1
-    if _step[0] % 100 == 0:
-        print(f"[step {_step[0]}] det_loss={total.item():.3f}  ewc_pen={pen.item():.3f}")
-    return total + pen, items
-det_model.loss = types.MethodType(loss_with_ewc, det_model)
+BN_BEFORE = {}
 
-before = {n: b.clone() for n, b in det_model.named_buffers() if 'running_' in n}
+def attach_ewc(trainer):
+    m = trainer.model                      # 실제 학습되는 모델
+    dev = next(m.parameters()).device
+    F = {n: f.to(dev) for n, f in FISHER_CPU.items()}
+    T = {n: t.to(dev) for n, t in THETA_CPU.items()}
 
-##*lambda 값 탐색
-#1. λ=0으로 구현 검증 (3~5 epoch)
-LAM = 0.0
-results = model.train(..., epochs=3, name="ewc_check_lam0")
-#2. penalty 크기 확인 (1~2 epoch)
-#3. 후보 2~3개로 본 실행
-## >> 이거 하면 경우의 수가 많이 늘 거 같은데, 선택 기준을 미리 정해야 할 듯
+    BN_BEFORE.clear()
+    BN_BEFORE.update({n: b.clone() for n, b in m.named_buffers() if 'running_' in n})
+
+    applied = [n for n, p in m.named_parameters()
+               if n in F and p.shape == F[n].shape
+               and n in T and p.shape == T[n].shape]
+    skipped = [n for n in F if n not in applied]
+    print(f"[EWC] 부착 완료 (LAM={LAM}): 적용 {len(applied)}, 제외 {len(skipped)}")
+    print(f"[EWC] 제외 key: {skipped}")
+    print(f"[EWC] 초기 penalty: {ewc_penalty(m, F, T, LAM).item():.6f}")   # 0이어야 정상
+
+    orig = m.loss
+    step = [0]
+    def loss_with_ewc(self, batch, preds=None):
+        total, items = orig(batch, preds)
+        pen = ewc_penalty(self, F, T, LAM) * batch['img'].shape[0]   # loss 스케일 맞춤
+        step[0] += 1
+        if step[0] % 100 == 0:
+            print(f"[step {step[0]}] det={total.item():.2f}  ewc={pen.item():.2f}")
+        return total + pen, items          # items는 3원소 유지
+    m.loss = types.MethodType(loss_with_ewc, m)
+
+model.add_callback("on_train_start", attach_ewc)
 
 # 4) 학습
 results = model.train(
     data=DATA_YAML,
-    imgsz=640, epochs=150, patience=15, batch=16, nbs=64,
+    imgsz=640, epochs=3, patience=15, batch=16, nbs=64,
     optimizer="AdamW", lr0=0.0005, lrf=0.01, weight_decay=0.01,
     cos_lr=True, warmup_epochs=5.0,
     mosaic=1.0, close_mosaic=20, mixup=0.15, copy_paste=0.1,
@@ -168,9 +172,18 @@ results = model.train(
     amp=True, workers=2, cache=False,
 )
 
-changed = [n for n, b in det_model.named_buffers()
-           if 'running_' in n and n in before and not torch.equal(before[n], b)]
-print(f"BN buffer 변경: {len(changed)}")
-print("최종 penalty:", ewc_penalty(det_model, FISHER, THETA, LAM).item())
+# ── 5) 학습 후 BN / penalty 확인 ─────────────────────────────────
+m = model.trainer.model
+dev = next(m.parameters()).device
+
+changed = [n for n, b in m.named_buffers()
+           if 'running_' in n and n in BN_BEFORE and not torch.equal(BN_BEFORE[n], b)]
+frozen_changed = [n for n in changed
+                  if any(n.startswith(f'model.{i}.') for i in range(FREEZE))]
+print(f"BN buffer 변경: 전체 {len(changed)}, frozen 구간 {len(frozen_changed)}")
+
+F = {n: f.to(dev) for n, f in FISHER_CPU.items()}
+T = {n: t.to(dev) for n, t in THETA_CPU.items()}
+print("최종 penalty:", ewc_penalty(m, F, T, LAM).item())
 
 #6. 평가로 이어지게
